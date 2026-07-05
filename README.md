@@ -69,6 +69,28 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+### EmbeddingGemma ONNX batch controls（向量嵌入批处理控制）
+
+使用 `embeddinggemma`（多语言向量嵌入模型）和 ONNX Runtime（ONNX
+推理运行时）时，MemPalace 会先按 token length（token 长度）排序输入，
+再用 greedy batching（贪心组批）组成静态 batch（批次）。每个 batch
+同时满足两个限制：
+
+- `MEMPALACE_EMBEDDING_BATCH_SIZE`（向量嵌入批次条目数上限）：单个
+  ONNX batch 的 item count（条目数）上限，默认 `32`。
+- `MEMPALACE_EMBEDDING_TOKEN_BUDGET`（向量嵌入 token 工作量预算）：padding
+  （填充）后的 token work（token 工作量）上限，默认 `32768`。
+
+在 DirectML provider（Windows GPU 执行提供器）下，如果推理触发 OOM
+（显存或内存不足），MemPalace 会在当前进程内降低 effective token
+budget（有效 token 预算），并重新排列尚未完成的输入继续处理。这个降级
+只影响当前进程，不会写回配置文件。
+
+Windows 原生 DirectML 错误有时会通过 `UnicodeDecodeError`（Unicode
+解码错误）表现出来；MemPalace 只会在 DirectML provider 的推理调用中把
+这类错误视为可降级错误。CPU（中央处理器）推理不会因此重试，且单条输入
+仍失败时会抛出原始错误。
+
 ### Docker
 
 A container image is also available for running the MCP server or the CLI

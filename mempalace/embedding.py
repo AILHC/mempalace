@@ -218,6 +218,67 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # sentence_embedding output is attention-masked, so sub-batch padding
 # does not change any row's vector.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
+_EMBEDDINGGEMMA_TOKEN_BUDGET = 32768
+
+
+def _plan_token_batches(
+    lengths: list[int],
+    max_batch_size: int,
+    token_budget: int,
+) -> list[list[int]]:
+    """Plan static ONNX runs by token length while preserving original indices.
+
+    Batches are built from shortest to longest so each run minimizes padding.
+    A single input whose length exceeds ``token_budget`` is still allowed as
+    its own batch; otherwise every planned run satisfies both the item limit
+    and ``batch_count * padded_token_length <= token_budget``.
+    """
+    if not lengths:
+        return []
+    if max_batch_size < 1:
+        raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
+    if token_budget < 1:
+        raise ValueError(f"token_budget must be >= 1, got {token_budget}")
+
+    batches: list[list[int]] = []
+    current: list[int] = []
+
+    for idx in sorted(range(len(lengths)), key=lambda i: (lengths[i], i)):
+        length = max(1, int(lengths[idx]))
+        if length > token_budget:
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([idx])
+            continue
+
+        candidate_count = len(current) + 1
+        if current and (
+            candidate_count > max_batch_size or candidate_count * length > token_budget
+        ):
+            batches.append(current)
+            current = []
+            candidate_count = 1
+
+        current.append(idx)
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _is_directml_oom(exc: BaseException, providers) -> bool:
+    """Return True for DirectML out-of-memory failures only."""
+    if not providers or "DmlExecutionProvider" not in providers:
+        return False
+    if isinstance(exc, UnicodeDecodeError):
+        # ONNX Runtime on Windows can fail to UTF-8 decode the native DirectML
+        # HRESULT message after logging the real 8007000E error. This is only
+        # treated as retryable inside the DirectML embedding run; batch=1 still
+        # raises the original exception.
+        return True
+    message = str(exc).lower()
+    return "8007000e" in message or "e_outofmemory" in message or "out of memory" in message
 
 
 class EmbeddinggemmaONNX:
@@ -245,14 +306,19 @@ class EmbeddinggemmaONNX:
         self,
         preferred_providers=None,
         batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE,
+        token_budget: int = _EMBEDDINGGEMMA_TOKEN_BUDGET,
         intra_op_num_threads: int = 0,
     ):
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if token_budget < 1:
+            raise ValueError(f"token_budget must be >= 1, got {token_budget}")
         self._providers = (
             list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
         )
         self._batch_size = batch_size
+        self._token_budget = token_budget
+        self._effective_token_budget = token_budget
         self._intra_op_num_threads = intra_op_num_threads
         self._session = None
         self._tokenizer = None
@@ -318,6 +384,37 @@ class EmbeddinggemmaONNX:
             # must already be in place when it becomes visible.
             self._session = session
 
+    def _reset_session(self) -> None:
+        """Drop the ORT session so the next lazy load can rebuild it once."""
+        self._session = None
+
+    def _batch_feed(self, token_ids, attention_masks, lengths, indices):
+        np = self._np
+        padded_len = max(max(1, lengths[i]) for i in indices)
+        input_rows = []
+        mask_rows = []
+        for idx in indices:
+            ids = list(token_ids[idx][:padded_len])
+            mask = list(attention_masks[idx][:padded_len])
+            if len(ids) < padded_len:
+                ids.extend([0] * (padded_len - len(ids)))
+            if len(mask) < padded_len:
+                mask.extend([0] * (padded_len - len(mask)))
+            input_rows.append(ids)
+            mask_rows.append(mask)
+        return {
+            "input_ids": np.asarray(input_rows, dtype=np.int64),
+            "attention_mask": np.asarray(mask_rows, dtype=np.int64),
+        }
+
+    def _run_token_batch(self, token_ids, attention_masks, lengths, indices):
+        np = self._np
+        feed = self._batch_feed(token_ids, attention_masks, lengths, indices)
+        outputs = self._session.run(None, feed)
+        sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
+        norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
+        return (sent_emb / norms).tolist()
+
     def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
         if isinstance(input, str):
             # A bare string would be iterated character by character below,
@@ -329,27 +426,66 @@ class EmbeddinggemmaONNX:
             # sequence is not rejected by ambiguous-truth-value semantics.
             return []
         self._lazy_load()
-        np = self._np
-        embeddings: list[list[float]] = []
-        # Tokenize and run per sub-batch, not over the whole input: padding
-        # is to the longest sequence in the sub-batch, and the ONNX runtime
-        # only ever holds batch_size rows of attention buffers at a time
-        # (#1770).
-        for start in range(0, len(input), self._batch_size):
-            chunk = input[start : start + self._batch_size]
-            texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
-            encs = self._tokenizer.encode_batch(texts)
-            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
-            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-            outputs = self._session.run(
-                None, {"input_ids": input_ids, "attention_mask": attention_mask}
+        texts = [_EMBEDDINGGEMMA_PREFIX + t for t in input]
+        encs = self._tokenizer.encode_batch(texts)
+        token_ids = [list(e.ids) for e in encs]
+        attention_masks = [list(e.attention_mask) for e in encs]
+        lengths = [
+            max(1, sum(1 for token in mask if token)) if mask else max(1, len(ids))
+            for ids, mask in zip(token_ids, attention_masks)
+        ]
+
+        embeddings: list[list[float] | None] = [None] * len(input)
+        pending = list(range(len(input)))
+        reset_available = True
+
+        while pending:
+            pending_lengths = [lengths[idx] for idx in pending]
+            planned_batches = _plan_token_batches(
+                pending_lengths,
+                self._batch_size,
+                self._effective_token_budget,
             )
-            sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
-            # L2-normalize so cosine similarity == dot product (matches what the
-            # MTEB methodology assumes; ChromaDB's distance is configured for it).
-            norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-            embeddings.extend((sent_emb / norms).tolist())
-        return embeddings
+            replanned = False
+
+            for batch_offset, batch in enumerate(planned_batches):
+                indices = [pending[idx] for idx in batch]
+                try:
+                    batch_embeddings = self._run_token_batch(
+                        token_ids,
+                        attention_masks,
+                        lengths,
+                        indices,
+                    )
+                except Exception as exc:
+                    if not _is_directml_oom(exc, self._providers):
+                        raise
+                    if len(indices) == 1:
+                        raise
+
+                    self._effective_token_budget = max(1, self._effective_token_budget // 2)
+                    if reset_available:
+                        reset_available = False
+                        self._reset_session()
+                        self._lazy_load()
+
+                    pending = [
+                        pending[idx]
+                        for remaining_batch in planned_batches[batch_offset:]
+                        for idx in remaining_batch
+                    ]
+                    replanned = True
+                    break
+
+                for original_idx, vector in zip(indices, batch_embeddings):
+                    embeddings[original_idx] = vector
+
+            if not replanned:
+                break
+
+        if any(vector is None for vector in embeddings):
+            raise RuntimeError("embeddinggemma batch planner left input rows without embeddings")
+        return [vector for vector in embeddings if vector is not None]
 
     def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
         """Embed query documents (ChromaDB EF protocol)."""
@@ -368,6 +504,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
     The returned function is shared across calls with the same resolved
     provider list + model so we only pay model-load cost once per process.
     """
+    cfg = None
     if device is None or model is None:
         from .config import MempalaceConfig
 
@@ -378,7 +515,18 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             model = cfg.embedding_model
 
     providers, effective = _resolve_providers(device)
-    cache_key = (model, tuple(providers))
+    batch_size = None
+    token_budget = None
+    if model == "embeddinggemma":
+        if cfg is None:
+            from .config import MempalaceConfig
+
+            cfg = MempalaceConfig()
+        batch_size = cfg.embedding_batch_size
+        token_budget = cfg.embedding_token_budget
+        cache_key = (model, tuple(providers), batch_size, token_budget)
+    else:
+        cache_key = (model, tuple(providers))
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
         return cached
@@ -389,7 +537,12 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
-            ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+            ef = EmbeddinggemmaONNX(
+                preferred_providers=providers,
+                batch_size=batch_size,
+                token_budget=token_budget,
+                intra_op_num_threads=threads,
+            )
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()

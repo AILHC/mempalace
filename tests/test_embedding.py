@@ -121,7 +121,13 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        def __init__(
+            self,
+            preferred_providers=None,
+            batch_size=0,
+            token_budget=0,
+            intra_op_num_threads=0,
+        ):
             captured["threads"] = intra_op_num_threads
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
@@ -133,6 +139,106 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     embedding.get_embedding_function("cpu", "embeddinggemma")
 
     assert captured["threads"] == 4
+
+
+def test_get_embedding_function_passes_embeddinggemma_batch_and_token_budget(monkeypatch):
+    captured = {}
+
+    class DummyGemma:
+        def __init__(
+            self,
+            preferred_providers=None,
+            batch_size=0,
+            token_budget=0,
+            intra_op_num_threads=0,
+        ):
+            captured["batch_size"] = batch_size
+            captured["token_budget"] = token_budget
+
+    class DummyConfig:
+        embedding_device = "cpu"
+        embedding_model = "embeddinggemma"
+        embedding_batch_size = 7
+        embedding_token_budget = 2048
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", lambda: DummyConfig())
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 0)
+
+    embedding.get_embedding_function()
+
+    assert captured == {"batch_size": 7, "token_budget": 2048}
+
+
+def test_embeddinggemma_cache_key_includes_static_batch_and_token_budget(monkeypatch):
+    instances = []
+
+    class DummyGemma:
+        def __init__(
+            self,
+            preferred_providers=None,
+            batch_size=0,
+            token_budget=0,
+            intra_op_num_threads=0,
+        ):
+            self.batch_size = batch_size
+            self.token_budget = token_budget
+            instances.append(self)
+
+    configs = [
+        type(
+            "Cfg",
+            (),
+            {
+                "embedding_device": "cpu",
+                "embedding_model": "embeddinggemma",
+                "embedding_batch_size": 7,
+                "embedding_token_budget": 2048,
+            },
+        )(),
+        type(
+            "Cfg",
+            (),
+            {
+                "embedding_device": "cpu",
+                "embedding_model": "embeddinggemma",
+                "embedding_batch_size": 8,
+                "embedding_token_budget": 2048,
+            },
+        )(),
+        type(
+            "Cfg",
+            (),
+            {
+                "embedding_device": "cpu",
+                "embedding_model": "embeddinggemma",
+                "embedding_batch_size": 8,
+                "embedding_token_budget": 1024,
+            },
+        )(),
+    ]
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", lambda: configs.pop(0))
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 0)
+
+    first = embedding.get_embedding_function()
+    second = embedding.get_embedding_function()
+    third = embedding.get_embedding_function()
+
+    assert first is not second
+    assert second is not third
+    assert [(ef.batch_size, ef.token_budget) for ef in instances] == [
+        (7, 2048),
+        (8, 2048),
+        (8, 1024),
+    ]
 
 
 def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):

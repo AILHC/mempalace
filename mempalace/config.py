@@ -234,6 +234,8 @@ def get_configured_collection_name() -> str:
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
 DEFAULT_MIN_CHUNK_SIZE = 50
+DEFAULT_EMBEDDING_BATCH_SIZE = 32
+DEFAULT_EMBEDDING_TOKEN_BUDGET = 32768
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -690,6 +692,48 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             return max(1, (os.cpu_count() or 2) // 2)
         return val if val > 0 else 0
+
+    def _positive_int_from_env_or_config(
+        self,
+        env_key: str,
+        config_key: str,
+        default: int,
+    ) -> int:
+        raw = os.environ.get(env_key)
+        if raw is not None:
+            coerced = self._try_coerce_int(raw, minimum=1)
+            return default if coerced is None else coerced
+        coerced = self._try_coerce_int(self._file_config.get(config_key, default), minimum=1)
+        return default if coerced is None else coerced
+
+    @property
+    def embedding_batch_size(self) -> int:
+        """Maximum number of documents per embeddinggemma ONNX run.
+
+        Read from ``MEMPALACE_EMBEDDING_BATCH_SIZE`` first, then
+        ``embedding_batch_size`` in ``config.json``, then ``32``. Invalid,
+        empty, bool, or non-positive values fall back to the default.
+        """
+        return self._positive_int_from_env_or_config(
+            "MEMPALACE_EMBEDDING_BATCH_SIZE",
+            "embedding_batch_size",
+            DEFAULT_EMBEDDING_BATCH_SIZE,
+        )
+
+    @property
+    def embedding_token_budget(self) -> int:
+        """Maximum padded tokens per embeddinggemma ONNX run.
+
+        The budget is ``batch_count * padded_token_length`` after token-aware
+        packing. Read from ``MEMPALACE_EMBEDDING_TOKEN_BUDGET`` first, then
+        ``embedding_token_budget`` in ``config.json``, then ``32768``. Invalid
+        or non-positive values fall back to the default.
+        """
+        return self._positive_int_from_env_or_config(
+            "MEMPALACE_EMBEDDING_TOKEN_BUDGET",
+            "embedding_token_budget",
+            DEFAULT_EMBEDDING_TOKEN_BUDGET,
+        )
 
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.

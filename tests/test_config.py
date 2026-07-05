@@ -150,6 +150,68 @@ def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
     assert cfg.embedding_threads == 2
 
 
+def test_embedding_batch_size_default(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_BATCH_SIZE", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embedding_batch_size == 32
+
+
+def test_embedding_batch_size_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_BATCH_SIZE", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_batch_size": 12}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_batch_size == 12
+
+
+def test_embedding_batch_size_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_batch_size": 12}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_BATCH_SIZE", "7")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_batch_size == 7
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "not-a-number", ""])
+def test_embedding_batch_size_invalid_falls_back_to_default(tmp_path, monkeypatch, raw):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_batch_size": 12}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_BATCH_SIZE", raw)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_batch_size == 32
+
+
+def test_embedding_token_budget_default(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_TOKEN_BUDGET", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embedding_token_budget == 32768
+
+
+def test_embedding_token_budget_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_TOKEN_BUDGET", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_token_budget": 4096}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_token_budget == 4096
+
+
+def test_embedding_token_budget_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_token_budget": 4096}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_TOKEN_BUDGET", "2048")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_token_budget == 2048
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "not-a-number", ""])
+def test_embedding_token_budget_invalid_falls_back_to_default(tmp_path, monkeypatch, raw):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_token_budget": 4096}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_TOKEN_BUDGET", raw)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_token_budget == 32768
+
+
 def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
     """sqlite_read_uri must open a read-only DB whose path contains spaces,
     which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""

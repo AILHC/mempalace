@@ -40,13 +40,14 @@ def _make_fake_session(out_dim=768):
 
     class _Session:
         def __init__(self, *args, **kwargs):
-            pass
+            self.run_batch_sizes = []
 
         def get_outputs(self):
             return [_Output("last_hidden_state"), _Output("sentence_embedding")]
 
         def run(self, _output_names, feed):
             batch = feed["input_ids"].shape[0]
+            self.run_batch_sizes.append(batch)
             # Deterministic non-trivial values so L2-norm isn't degenerate.
             sent = np.arange(batch * out_dim, dtype=np.float32).reshape(batch, out_dim) + 1.0
             last_hidden = np.zeros((batch, feed["input_ids"].shape[1], out_dim), dtype=np.float32)
@@ -88,7 +89,12 @@ def patched_lazy_load(monkeypatch):
     Returns a dict of recording counters so tests can assert how many times
     each was called (e.g. confirm lazy-load caches after first call).
     """
-    calls = {"hf_hub_download": 0, "InferenceSession": 0, "Tokenizer.from_file": 0}
+    calls = {
+        "hf_hub_download": 0,
+        "InferenceSession": 0,
+        "Tokenizer.from_file": 0,
+        "sessions": [],
+    }
 
     def fake_download(repo, filename=None, subfolder=None, **kwargs):
         calls["hf_hub_download"] += 1
@@ -98,7 +104,9 @@ def patched_lazy_load(monkeypatch):
 
     def fake_session_ctor(*args, **kwargs):
         calls["InferenceSession"] += 1
-        return fake_session_cls()
+        session = fake_session_cls()
+        calls["sessions"].append(session)
+        return session
 
     def fake_tokenizer_from_file(_path):
         calls["Tokenizer.from_file"] += 1
@@ -172,12 +180,12 @@ def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
     (#1770) — so __call__ may never see more than _EMBEDDINGGEMMA_BATCH_SIZE
     docs per forward pass.
     """
-    batch_sizes = []
+    tokenized_batch_sizes = []
     captured_texts = []
     original_encode_batch = _FakeTokenizer.encode_batch
 
     def recording_encode_batch(self, texts):
-        batch_sizes.append(len(texts))
+        tokenized_batch_sizes.append(len(texts))
         captured_texts.extend(texts)
         return original_encode_batch(self, texts)
 
@@ -187,11 +195,12 @@ def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
     docs = [f"doc {i}" for i in range(n)]
     out = ef(docs)
 
-    assert batch_sizes == [
+    assert tokenized_batch_sizes == [n], "all docs should be tokenized in one call"
+    assert patched_lazy_load["sessions"][0].run_batch_sizes == [
         embedding._EMBEDDINGGEMMA_BATCH_SIZE,
         embedding._EMBEDDINGGEMMA_BATCH_SIZE,
         6,
-    ], f"expected bounded sub-batches, got {batch_sizes}"
+    ], f"expected bounded sub-batches, got {patched_lazy_load['sessions'][0].run_batch_sizes}"
     # Sub-batches must cover the input in order; combined with the per-chunk
     # extend in __call__ this pins output row order to input order.
     assert captured_texts == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
@@ -215,33 +224,17 @@ _B = 32  # mirrors _EMBEDDINGGEMMA_BATCH_SIZE; literal so the cases read plainly
 def test_call_chunk_boundaries(patched_lazy_load, monkeypatch, n, expected_batches):
     """Exact-multiple and off-by-one inputs produce no empty or oversized runs."""
     assert _B == embedding._EMBEDDINGGEMMA_BATCH_SIZE, "update _B alongside the constant"
-    batch_sizes = []
-    original_encode_batch = _FakeTokenizer.encode_batch
-
-    def recording_encode_batch(self, texts):
-        batch_sizes.append(len(texts))
-        return original_encode_batch(self, texts)
-
-    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
     ef = embedding.EmbeddinggemmaONNX()
     out = ef([f"doc {i}" for i in range(n)])
-    assert batch_sizes == expected_batches
+    assert patched_lazy_load["sessions"][0].run_batch_sizes == expected_batches
     assert len(out) == n
 
 
 def test_custom_batch_size_is_honored(patched_lazy_load, monkeypatch):
     """The constructor knob must drive the sub-batch split."""
-    batch_sizes = []
-    original_encode_batch = _FakeTokenizer.encode_batch
-
-    def recording_encode_batch(self, texts):
-        batch_sizes.append(len(texts))
-        return original_encode_batch(self, texts)
-
-    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
     ef = embedding.EmbeddinggemmaONNX(batch_size=10)
     out = ef([f"doc {i}" for i in range(24)])
-    assert batch_sizes == [10, 10, 4]
+    assert patched_lazy_load["sessions"][0].run_batch_sizes == [10, 10, 4]
     assert len(out) == 24
 
 
