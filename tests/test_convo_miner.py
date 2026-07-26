@@ -629,6 +629,114 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_prefetch_mined_set_treats_legacy_source_as_current_when_filed_after_mtime():
+    """Legacy drawers can be skipped without a destructive one-time rebuild
+    when their filed_at proves the source had not changed before ingestion."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text("legacy source")
+        source_mtime = time.time() - 120
+        os.utime(convo_path, (source_mtime, source_mtime))
+        resolved_file = str(convo_path.resolve())
+
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        col.upsert(
+            ids=["drawer_legacy_current"],
+            documents=["legacy content"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": resolved_file,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,
+                    "filed_at": "2099-01-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+
+        assert abs(mined[resolved_file] - source_mtime) < 0.001
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_keeps_legacy_source_stale_when_mtime_is_newer_than_filed_at():
+    """A legacy drawer must be rebuilt when the source changed after it was filed."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text("changed source")
+        source_mtime = time.time() + 120
+        os.utime(convo_path, (source_mtime, source_mtime))
+        resolved_file = str(convo_path.resolve())
+
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        col.upsert(
+            ids=["drawer_legacy_stale"],
+            documents=["legacy content"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": resolved_file,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,
+                    "filed_at": "2000-01-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+
+        assert mined[resolved_file] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_incomplete_marker_forces_retry():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text("partially replaced source")
+        resolved_file = str(convo_path.resolve())
+        source_mtime = os.path.getmtime(convo_path)
+
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        common = {
+            "wing": "test",
+            "source_file": resolved_file,
+            "extract_mode": "exchange",
+            "normalize_version": 999,
+            "source_mtime": source_mtime,
+            "filed_at": "2099-01-01T00:00:00+00:00",
+        }
+        col.upsert(
+            ids=["drawer_existing", "registry_incomplete"],
+            documents=["existing content", "[registry]"],
+            metadatas=[
+                {**common, "room": "general", "chunk_index": 0},
+                {**common, "room": "_registry", "ingest_complete": False},
+            ],
+        )
+
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+
+        assert mined[resolved_file] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_reprocesses_legacy_drawer_without_stored_mtime(capsys):
     """A file mined before source_mtime was tracked (simulated: drawer
     written directly, no source_mtime field) must be re-mined on the next

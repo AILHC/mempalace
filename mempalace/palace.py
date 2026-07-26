@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import threading
+from datetime import datetime
 from typing import Optional
 
 from .backends import (
@@ -1220,6 +1221,17 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
 
 
+def _filed_at_timestamp(value) -> Optional[float]:
+    """Parse a drawer's ISO-8601 filed_at value into an epoch timestamp."""
+    if not isinstance(value, str):
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -1232,10 +1244,16 @@ def file_already_mined(
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade)
-      - `check_mtime=True` and the file's mtime differs from the stored one
+      - an incomplete replacement marker exists
+      - `check_mtime=True` and the file changed after its last completed filing
 
-    When check_mtime=True (used by the project miner, and by the convo
-    miner's in-lock recheck), also re-mines on content change. Conversation
+    Legacy drawers without `source_mtime` are considered current only when
+    their `filed_at` timestamp is not older than the source file's mtime.
+    This avoids a destructive one-time rebuild while still detecting sources
+    modified after their legacy drawers were written.
+
+    When check_mtime=True (used by the project miner, and by the convo miner's
+    in-lock recheck), also re-mines on content change. Conversation
     transcripts are NOT assumed immutable: a Claude Code session keeps
     appending to its own file while active, and /compact or /clear can
     rewrite one in place. The convo miner's bulk skip-check uses
@@ -1263,6 +1281,11 @@ def file_already_mined(
         # extract_mode-is-set branch lets the function short-circuit on the
         # first matching group regardless of ordering.
         current_mtime = os.path.getmtime(source_file) if check_mtime else None
+        found_current = False
+        incomplete = False
+        completion_marker: tuple[Optional[float], Optional[float]] | None = None
+        legacy_mtime_matches = False
+        latest_legacy_filed_at: Optional[float] = None
         offset = 0
         while True:
             results = collection.get(
@@ -1284,17 +1307,42 @@ def file_already_mined(
                 stored_version = meta.get("normalize_version", 1)
                 if stored_version < NORMALIZE_VERSION:
                     continue
-                if not check_mtime:
-                    return True
+                found_current = True
+                ingest_complete = meta.get("ingest_complete")
                 stored_mtime = meta.get("source_mtime")
-                if stored_mtime is None:
+                parsed_mtime = float(stored_mtime) if stored_mtime is not None else None
+                filed_at = _filed_at_timestamp(meta.get("filed_at"))
+                if ingest_complete is False:
+                    incomplete = True
                     continue
-                if abs(float(stored_mtime) - current_mtime) < 0.001:
-                    return True
+                if ingest_complete is True:
+                    completion_marker = (parsed_mtime, filed_at)
+                    continue
+                if not check_mtime:
+                    continue
+                if parsed_mtime is not None and abs(parsed_mtime - current_mtime) < 0.001:
+                    legacy_mtime_matches = True
+                if filed_at is not None and (
+                    latest_legacy_filed_at is None or filed_at > latest_legacy_filed_at
+                ):
+                    latest_legacy_filed_at = filed_at
             if not ids:
                 break
             offset += len(ids)
-        return False
+        if incomplete:
+            return False
+        if not check_mtime:
+            return found_current
+        if completion_marker is not None:
+            marker_mtime, marker_filed_at = completion_marker
+            if marker_mtime is not None:
+                return abs(marker_mtime - current_mtime) < 0.001
+            return marker_filed_at is not None and current_mtime <= marker_filed_at + 0.001
+        if legacy_mtime_matches:
+            return True
+        return (
+            latest_legacy_filed_at is not None and current_mtime <= latest_legacy_filed_at + 0.001
+        )
     except Exception:
         return False
 
@@ -1322,12 +1370,18 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
+    Completion sentinels override legacy rows: an incomplete sentinel forces a
+    retry, while a completed sentinel supplies the authoritative source mtime.
+    For legacy rows without `source_mtime`, `filed_at` is used as a conservative
+    upper bound so unchanged sources do not require a one-time rebuild.
+
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
     mined: dict[str, Optional[float]] = {}
+    source_states: dict[str, dict] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1343,11 +1397,68 @@ def prefetch_mined_set(
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
                 if version >= NORMALIZE_VERSION:
+                    state = source_states.setdefault(
+                        src,
+                        {
+                            "incomplete": False,
+                            "marker": None,
+                            "legacy_mtimes": set(),
+                            "latest_legacy_filed_at": None,
+                        },
+                    )
                     stored_mtime = meta.get("source_mtime")
-                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
+                    parsed_mtime = float(stored_mtime) if stored_mtime is not None else None
+                    filed_at = _filed_at_timestamp(meta.get("filed_at"))
+                    ingest_complete = meta.get("ingest_complete")
+                    if ingest_complete is False:
+                        state["incomplete"] = True
+                    elif ingest_complete is True:
+                        state["marker"] = (parsed_mtime, filed_at)
+                    else:
+                        if parsed_mtime is not None:
+                            state["legacy_mtimes"].add(parsed_mtime)
+                        if filed_at is not None and (
+                            state["latest_legacy_filed_at"] is None
+                            or filed_at > state["latest_legacy_filed_at"]
+                        ):
+                            state["latest_legacy_filed_at"] = filed_at
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
+        for src, state in source_states.items():
+            if state["incomplete"]:
+                mined[src] = None
+                continue
+            try:
+                current_mtime = os.path.getmtime(src)
+            except OSError:
+                mined[src] = None
+                continue
+            marker = state["marker"]
+            if marker is not None:
+                marker_mtime, marker_filed_at = marker
+                if marker_mtime is not None:
+                    mined[src] = (
+                        current_mtime if abs(marker_mtime - current_mtime) < 0.001 else None
+                    )
+                else:
+                    mined[src] = (
+                        current_mtime
+                        if marker_filed_at is not None and current_mtime <= marker_filed_at + 0.001
+                        else None
+                    )
+                continue
+            if any(
+                abs(stored_mtime - current_mtime) < 0.001 for stored_mtime in state["legacy_mtimes"]
+            ):
+                mined[src] = current_mtime
+                continue
+            latest_filed_at = state["latest_legacy_filed_at"]
+            mined[src] = (
+                current_mtime
+                if latest_filed_at is not None and current_mtime <= latest_filed_at + 0.001
+                else None
+            )
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
     return mined

@@ -14,6 +14,7 @@ from mempalace.convo_miner import (
     detect_convo_room,
     scan_convos,
 )
+from mempalace.ids import make_convo_sentinel_id
 
 
 class TestChunkExchanges:
@@ -517,6 +518,7 @@ class TestFileChunksLocked:
         class FakeCol:
             def __init__(self):
                 self.batch_sizes = []
+                self.sentinel_states = []
 
             def delete(self, *args, **kwargs):
                 pass
@@ -527,7 +529,10 @@ class TestFileChunksLocked:
                 return {"ids": [], "metadatas": []}
 
             def upsert(self, documents, ids, metadatas):
-                self.batch_sizes.append(len(documents))
+                if ids[0].startswith("_reg_"):
+                    self.sentinel_states.append(metadatas[0]["ingest_complete"])
+                else:
+                    self.batch_sizes.append(len(documents))
 
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
         col = FakeCol()
@@ -546,6 +551,151 @@ class TestFileChunksLocked:
         assert dict(room_counts) == {}
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+        assert col.sentinel_states == [False, True]
+
+    def test_failure_keeps_old_drawers_and_leaves_incomplete_sentinel(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        source_file = "chat.txt"
+        sentinel_id = make_convo_sentinel_id(source_file, "exchange")
+
+        class FakeCol:
+            def __init__(self):
+                self.rows = {
+                    "old_0": {
+                        "document": "old zero",
+                        "metadata": {
+                            "source_file": source_file,
+                            "chunk_index": 0,
+                            "extract_mode": "exchange",
+                        },
+                    },
+                    "old_tail": {
+                        "document": "old tail",
+                        "metadata": {
+                            "source_file": source_file,
+                            "chunk_index": 99,
+                            "extract_mode": "exchange",
+                        },
+                    },
+                }
+                self.data_batch_count = 0
+
+            def delete(self, ids):
+                for drawer_id in ids:
+                    self.rows.pop(drawer_id, None)
+
+            def get(self, ids=None, include=None, **kwargs):
+                if ids is not None:
+                    found = [
+                        (drawer_id, self.rows[drawer_id])
+                        for drawer_id in ids
+                        if drawer_id in self.rows
+                    ]
+                else:
+                    offset = kwargs.get("offset", 0)
+                    limit = kwargs.get("limit", len(self.rows))
+                    found = list(self.rows.items())[offset : offset + limit]
+                return {
+                    "ids": [drawer_id for drawer_id, _row in found],
+                    "metadatas": [row["metadata"] for _drawer_id, row in found],
+                }
+
+            def upsert(self, documents, ids, metadatas):
+                if ids != [sentinel_id]:
+                    self.data_batch_count += 1
+                    if self.data_batch_count == 2:
+                        raise RuntimeError("simulated batch failure")
+                for document, drawer_id, metadata in zip(documents, ids, metadatas):
+                    self.rows[drawer_id] = {"document": document, "metadata": metadata}
+
+        chunks = [{"content": f"new chunk {i}", "chunk_index": i} for i in range(2)]
+        col = FakeCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        with pytest.raises(RuntimeError, match="simulated batch failure"):
+            _file_chunks_locked(
+                col,
+                source_file,
+                chunks,
+                "wing",
+                "general",
+                "agent",
+                "exchange",
+            )
+
+        assert "old_0" in col.rows
+        assert "old_tail" in col.rows
+        assert col.rows[sentinel_id]["metadata"]["ingest_complete"] is False
+
+    def test_empty_replacement_removes_old_drawers_after_completion(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        source_file = "chat.txt"
+        sentinel_id = make_convo_sentinel_id(source_file, "exchange")
+
+        class FakeCol:
+            def __init__(self):
+                self.rows = {
+                    "old_0": {
+                        "document": "old content",
+                        "metadata": {
+                            "source_file": source_file,
+                            "chunk_index": 0,
+                            "extract_mode": "exchange",
+                        },
+                    }
+                }
+
+            def delete(self, ids):
+                for drawer_id in ids:
+                    self.rows.pop(drawer_id, None)
+
+            def get(self, ids=None, include=None, **kwargs):
+                if ids is not None:
+                    found = [
+                        (drawer_id, self.rows[drawer_id])
+                        for drawer_id in ids
+                        if drawer_id in self.rows
+                    ]
+                else:
+                    offset = kwargs.get("offset", 0)
+                    limit = kwargs.get("limit", len(self.rows))
+                    found = list(self.rows.items())[offset : offset + limit]
+                return {
+                    "ids": [drawer_id for drawer_id, _row in found],
+                    "metadatas": [row["metadata"] for _drawer_id, row in found],
+                }
+
+            def upsert(self, documents, ids, metadatas):
+                for document, drawer_id, metadata in zip(documents, ids, metadatas):
+                    self.rows[drawer_id] = {"document": document, "metadata": metadata}
+
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+
+        drawers, _room_counts, skipped = _file_chunks_locked(
+            col,
+            source_file,
+            [],
+            "wing",
+            "_registry",
+            "agent",
+            "exchange",
+        )
+
+        assert drawers == 0
+        assert skipped is False
+        assert "old_0" not in col.rows
+        assert col.rows[sentinel_id]["metadata"]["ingest_complete"] is True
 
     def test_populates_entities_metadata(self, monkeypatch):
         import mempalace.convo_miner as convo_miner
@@ -578,7 +728,8 @@ class TestFileChunksLocked:
 
         _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
 
-        entities = col.metas[0]["entities"].split(";")
+        drawer_meta = next(meta for meta in col.metas if "entities" in meta)
+        entities = drawer_meta["entities"].split(";")
         assert "MemoryStack" in entities
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities

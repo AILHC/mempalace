@@ -117,12 +117,19 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
-    """Write a sentinel so file_already_mined() returns True for 0-chunk files.
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    *,
+    ingest_complete: bool = True,
+):
+    """Write the deterministic completion sentinel for a source file.
 
-    Without this, files that normalize to nothing or produce zero chunks are
-    re-read and re-processed on every mine run because nothing was written to
-    ChromaDB on the first pass.
+    A false marker makes an interrupted replacement retryable. A true marker
+    also prevents zero-chunk files from being reprocessed on every mine run.
 
     Stamps source_mtime like every real drawer does, so a file that later
     grows past the min-chunk-size floor (e.g. a short session that gets
@@ -142,6 +149,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
         "filed_at": datetime.now().isoformat(),
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
+        "ingest_complete": ingest_complete,
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
@@ -489,11 +497,11 @@ def _extract_authored_at(filepath):
 def _file_chunks_locked(
     collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and replace its drawers without a delete-first gap.
 
     Combines the per-file serialization that prevents concurrent agents from
     duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
+    (upsert-before-purge with a completion marker) that fires on
     either a normalize-version bump OR a changed/grown source file (mtime
     differs from what's stored) -- transcripts are not assumed immutable,
     since a Claude Code session keeps appending to its own file while
@@ -506,20 +514,20 @@ def _file_chunks_locked(
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
+        # still fall through to the rebuild path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+        existing_ids = set(_source_file_delete_ids(collection, source_file, extract_mode))
+        sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
+        _register_file(
+            collection,
+            source_file,
+            wing,
+            agent,
+            extract_mode,
+            ingest_complete=False,
+        )
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
@@ -530,6 +538,7 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+        new_ids: set[str] = set()
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -568,10 +577,22 @@ def _file_chunks_locked(
                     ids=batch_ids,
                     metadatas=batch_metas,
                 )
+                new_ids.update(batch_ids)
                 drawers_added += len(batch_docs)
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+        stale_ids = sorted(existing_ids - new_ids - {sentinel_id})
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+        _register_file(
+            collection,
+            source_file,
+            wing,
+            agent,
+            extract_mode,
+            ingest_complete=True,
+        )
     return drawers_added, room_counts_delta, False
 
 
@@ -804,13 +825,21 @@ def _mine_convos_impl(
         try:
             content = normalize(str(filepath))
         except (OSError, ValueError):
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+            # A normalization failure is not a completed ingestion. Preserve
+            # existing drawers and retry the source on the next run.
             continue
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _file_chunks_locked(
+                    collection,
+                    source_file,
+                    [],
+                    wing,
+                    "_registry",
+                    agent,
+                    extract_mode,
+                )
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -828,7 +857,15 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _file_chunks_locked(
+                    collection,
+                    source_file,
+                    [],
+                    wing,
+                    "_registry",
+                    agent,
+                    extract_mode,
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -861,8 +898,8 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
+        # Lock + recoverable replacement. The completion marker serializes
+        # retry state; stale drawers are removed only after fresh writes land.
         drawers_added, room_delta, skipped = _file_chunks_locked(
             collection,
             source_file,
